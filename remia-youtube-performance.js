@@ -29,7 +29,7 @@
         optimizeSearchCards: true,
         optimizeWatchRecommendations: true,
         // Opt in: expanded replies have highly variable heights.
-        optimizeWatchComments: false,
+        optimizeWatchComments: true,
         // Additional yt-lockup-view-model selectors, without nesting
         // containment inside the legacy cards targeted below.
         includeModernCards: true,
@@ -45,7 +45,7 @@
         thumbnailSkipFirst: 8,
         thumbnailHydrationDelayMs: 900,
         // Opt in: only decorative image transitions are suppressed.
-        reduceThumbnailTransitionsWhileScrolling: false,
+        reduceThumbnailTransitionsWhileScrolling: true,
         scrollIdleMs: 160,
         // Initial estimates in CSS pixels, NOT fixed card heights.
         // After rendering, the browser can remember each card's size.
