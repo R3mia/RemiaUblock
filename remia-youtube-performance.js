@@ -3,7 +3,7 @@
 /*
  * Remia's YouTube Performance — uBlock Origin custom scriptlet
  * Target: desktop YouTube on Firefox / Zen Browser
- * Version: 1.2.0 (2026-11-09)
+ * Version: 1.4.0 (2026-11-09)
  *
  * INSTALL:
  * 1. Host this file as raw text over HTTPS.
@@ -16,7 +16,8 @@
  * Use a comment-only line to separate sections instead.
  *
  * CSS and bounded image hints; telemetry rules live in the paired filters.
- * Rendering optimization only: no promise of lower network traffic,
+ * Player-poster priority uses hints; an LCP improvement is not guaranteed.
+ * Rendering/loading hints: no promise of lower network traffic,
  * smaller JS bundles, lower memory usage, or higher video frame rates.
  * Hiding ambient visuals does not disable YouTube's background JS work.
  * YouTube markup can change; disable a group if its layout misbehaves.
@@ -29,7 +30,7 @@
         optimizeSearchCards: true,
         optimizeWatchRecommendations: true,
         // Opt in: expanded replies have highly variable heights.
-        optimizeWatchComments: true,
+        optimizeWatchComments: false,
         // Additional yt-lockup-view-model selectors, without nesting
         // containment inside the legacy cards targeted below.
         includeModernCards: true,
@@ -38,8 +39,15 @@
         // Prefer disabling Ambient mode in YouTube's own player settings.
         hideAmbientBackground: true,
         reduceSkeletonAnimations: true,
+        // Appearance: remove frosted-glass filters from selected UI surfaces.
+        // Set false to restore YouTube's own backdrop effects.
+        reduceBackdropBlur: true,
         // Bounded thumbnail-only hints; existing decoding attributes win.
         asyncThumbnailDecoding: true,
+        // Prioritize only the current watch page's actual player poster.
+        prioritizePlayerPoster: true,
+        playerPosterWatchMs: 5000,
+        maxPlayerPosterChecks: 48,
         maxThumbnailImagesPerPass: 160,
         // Protect leading thumbnails by DOM order, without layout measurements.
         thumbnailSkipFirst: 8,
@@ -62,7 +70,7 @@
     if (location.hostname !== 'www.youtube.com' &&
         location.hostname !== 'youtube.com') return;
     //
-    const VERSION = '1.2.0';
+    const VERSION = '1.4.0';
     const STYLE_ID = 'remia-youtube-performance-style';
     const RUNTIME_ATTR = 'data-remia-yt-perf-runtime';
     const SCROLL_ATTR = 'data-remia-yt-scrolling';
@@ -175,13 +183,29 @@
             '}'
         );
     }
+    //
+    if (CONFIG.reduceBackdropBlur) {
+        rules.push([
+            'ytd-masthead #background',
+            'ytd-app #frosted-glass',
+            'ytd-app #guide-content',
+            'ytd-mini-guide-renderer',
+            'ytd-playlist-panel-renderer#playlist',
+            'ytd-watch-metadata #description-inner',
+            '#movie_player .ytp-popup'
+        ].join(',\n') + ' {\n' +
+            '  backdrop-filter: none !important;\n' +
+            '  -webkit-backdrop-filter: none !important;\n' +
+            '}'
+        );
+    }
     // Screen-only rules leave the page's print layout alone.
     const cssText = rules.length
         ? '@media screen {\n' + rules.join('\n') + '\n}\n'
         : '';
     //
     function startRuntime() {
-        if (!CONFIG.asyncThumbnailDecoding &&
+        if (!CONFIG.asyncThumbnailDecoding && !CONFIG.prioritizePlayerPoster &&
             !CONFIG.reduceThumbnailTransitionsWhileScrolling) return;
         const root = document.documentElement;
         if (root.hasAttribute(RUNTIME_ATTR)) return;
@@ -193,6 +217,14 @@
         let decodeJob = null;
         let decodeUsesIdle = false;
         let lateTimer = null;
+        let posterObserver = null;
+        let posterRoot = null;
+        let posterTimer = null;
+        let posterJob = null;
+        let posterVideo = '';
+        let posterFinished = false;
+        let posterChecks = 0;
+        let posterPreload = null;
         //
         function active() {
             return !suspended && !navigating && !document.hidden;
@@ -203,6 +235,127 @@
             scrolling = false;
             root.removeAttribute(SCROLL_ATTR);
         }
+        function stopPosterWatch() {
+            if (posterObserver) posterObserver.disconnect();
+            posterObserver = null;
+            posterRoot = null;
+            if (posterTimer !== null) window.clearTimeout(posterTimer);
+            if (posterJob !== null) window.clearTimeout(posterJob);
+            posterTimer = null;
+            posterJob = null;
+        }
+        function resetPoster() {
+            stopPosterWatch();
+            posterVideo = '';
+            posterFinished = false;
+            if (posterPreload) posterPreload.remove();
+            posterPreload = null;
+        }
+        function watchVideoId() {
+            if (location.pathname !== '/watch') return '';
+            const id = new URL(location.href).searchParams.get('v') || '';
+            return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : '';
+        }
+        function posterUrl(value) {
+            if (!value) return '';
+            try {
+                const url = new URL(value, document.baseURI);
+                if (url.protocol !== 'https:' ||
+                    !/^(?:[a-z0-9-]+\.)*ytimg\.com$/i.test(url.hostname)) return '';
+                const match = /^\/vi(?:_webp)?\/([^/]+)\//.exec(url.pathname);
+                return match && match[1] === posterVideo ? url.href : '';
+            } catch (_) { return ''; }
+        }
+        function bindPosterObserver(target) {
+            if (!posterObserver || target === posterRoot) return;
+            posterObserver.disconnect();
+            posterRoot = target;
+            const options = { childList: true, subtree: true };
+            if (target !== document.documentElement) {
+                options.attributes = true;
+                options.attributeFilter = ['src', 'srcset', 'style', 'class', 'hidden'];
+            }
+            posterObserver.observe(target, options);
+        }
+        function prioritizePoster() {
+            if (!active() || watchVideoId() !== posterVideo ||
+                ++posterChecks > CONFIG.maxPlayerPosterChecks) {
+                stopPosterWatch();
+                return true;
+            }
+            const player = document.querySelector('ytd-watch-flexy:not([hidden]) ytd-player');
+            if (!player) return false;
+            bindPosterObserver(player);
+            const video = player.querySelector('video');
+            if (video && !video.paused && video.readyState >= 2) {
+                posterFinished = true;
+                stopPosterWatch();
+                return true;
+            }
+            const posters = player.querySelectorAll(
+                '.ytp-cued-thumbnail-overlay-image, .ytp-cued-thumbnail-overlay img'
+            );
+            for (let i = 0; i < Math.min(posters.length, 4); i++) {
+                const node = posters[i];
+                if (!node.isConnected || node.closest('[hidden], [aria-hidden="true"]')) continue;
+                const overlay = node.closest('.ytp-cued-thumbnail-overlay') || node;
+                const visible = window.getComputedStyle(overlay);
+                if (visible.display === 'none' || visible.visibility === 'hidden') continue;
+                if (node.localName === 'img') {
+                    if (!posterUrl(node.currentSrc) && !posterUrl(node.getAttribute('src'))) continue;
+                    if (node.getAttribute('fetchpriority') !== 'high') {
+                        node.setAttribute('fetchpriority', 'high');
+                    }
+                    if (node.getAttribute('loading') !== 'eager') node.setAttribute('loading', 'eager');
+                } else {
+                    const background = node.style.backgroundImage ||
+                        window.getComputedStyle(node).backgroundImage;
+                    const match = /^url\(\s*(?:"([^"]+)"|'([^']+)'|([^)"'\s]+))\s*\)$/.exec(background);
+                    const url = match && posterUrl(match[1] || match[2] || match[3]);
+                    if (!url) continue;
+                    let existing = null;
+                    for (const link of document.querySelectorAll('link[rel~="preload"][as="image"]')) {
+                        if (link.href === url) { existing = link; break; }
+                    }
+                    if (existing) {
+                        existing.setAttribute('fetchpriority', 'high');
+                    } else {
+                        const link = document.createElement('link');
+                        link.setAttribute('rel', 'preload');
+                        link.setAttribute('as', 'image');
+                        link.setAttribute('fetchpriority', 'high');
+                        link.setAttribute('href', url);
+                        link.setAttribute('data-remia-yt-poster', posterVideo);
+                        (document.head || root).appendChild(link);
+                        posterPreload = link;
+                    }
+                }
+                posterFinished = true;
+                stopPosterWatch();
+                return true;
+            }
+            return false;
+        }
+        function startPosterPriority() {
+            if (!CONFIG.prioritizePlayerPoster || !active()) return;
+            const id = watchVideoId();
+            if (!id || id === posterVideo) return;
+            resetPoster();
+            posterVideo = id;
+            posterChecks = 0;
+            if (prioritizePoster() || typeof MutationObserver !== 'function') return;
+            posterObserver = new MutationObserver(() => {
+                if (posterJob !== null) return;
+                posterJob = window.setTimeout(() => {
+                    posterJob = null;
+                    prioritizePoster();
+                }, 0);
+            });
+            bindPosterObserver(
+                document.querySelector('ytd-watch-flexy:not([hidden]) ytd-player') || root
+            );
+            posterTimer = window.setTimeout(stopPosterWatch, CONFIG.playerPosterWatchMs);
+        }
         function stopJobs() {
             clearScrolling();
             if (decodeJob !== null) {
@@ -212,6 +365,8 @@
             decodeJob = null;
             if (lateTimer !== null) window.clearTimeout(lateTimer);
             lateTimer = null;
+            stopPosterWatch();
+            if (!posterFinished) posterVideo = '';
         }
         function decodeThumbnails() {
             const images = document.querySelectorAll(THUMBNAILS.join(','));
@@ -247,7 +402,9 @@
                 : window.setTimeout(run, 50);
         }
         function activate() {
-            if (!active() || document.readyState === 'loading') return;
+            if (!active()) return;
+            startPosterPriority();
+            if (document.readyState === 'loading') return;
             queueDecode();
             if (!CONFIG.asyncThumbnailDecoding) return;
             if (lateTimer !== null) window.clearTimeout(lateTimer);
@@ -273,6 +430,7 @@
         document.addEventListener('yt-navigate-start', () => {
             navigating = true;
             stopJobs();
+            resetPoster();
         }, true);
         document.addEventListener('yt-navigate-finish', () => {
             navigating = false;
@@ -294,7 +452,8 @@
         });
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', activate, { once: true });
-        } else activate();
+        }
+        activate();
     }
     //
     function installStyle() {
@@ -328,8 +487,8 @@
         }
         return true;
     }
-    // CSS matches SPA content automatically. Optional runtime work is bounded
-    // and event-driven, without DOM observers or browser API replacements.
+    // CSS matches SPA content automatically. Poster discovery uses a temporary
+    // observer; other runtime work is bounded and native browser APIs stay intact.
     if (installStyle()) {
         startRuntime();
         return;
