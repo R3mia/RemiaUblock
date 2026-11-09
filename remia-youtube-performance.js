@@ -3,7 +3,7 @@
 /*
  * Remia's YouTube Performance — uBlock Origin custom scriptlet
  * Target: desktop YouTube on Firefox / Zen Browser
- * Version: 1.1.0 (2026-11-09)
+ * Version: 1.2.0 (2026-11-09)
  *
  * INSTALL:
  * 1. Host this file as raw text over HTTPS.
@@ -15,6 +15,7 @@
  * this resource. uBO treats them as the end of its JavaScript body.
  * Use a comment-only line to separate sections instead.
  *
+ * CSS and bounded image hints; telemetry rules live in the paired filters.
  * Rendering optimization only: no promise of lower network traffic,
  * smaller JS bundles, lower memory usage, or higher video frame rates.
  * Hiding ambient visuals does not disable YouTube's background JS work.
@@ -37,6 +38,15 @@
         // Prefer disabling Ambient mode in YouTube's own player settings.
         hideAmbientBackground: true,
         reduceSkeletonAnimations: true,
+        // Bounded thumbnail-only hints; existing decoding attributes win.
+        asyncThumbnailDecoding: true,
+        maxThumbnailImagesPerPass: 160,
+        // Protect leading thumbnails by DOM order, without layout measurements.
+        thumbnailSkipFirst: 8,
+        thumbnailHydrationDelayMs: 900,
+        // Opt in: only decorative image transitions are suppressed.
+        reduceThumbnailTransitionsWhileScrolling: false,
+        scrollIdleMs: 160,
         // Initial estimates in CSS pixels, NOT fixed card heights.
         // After rendering, the browser can remember each card's size.
         estimatedBlockSize: {
@@ -52,8 +62,14 @@
     if (location.hostname !== 'www.youtube.com' &&
         location.hostname !== 'youtube.com') return;
     //
-    const VERSION = '1.1.0';
+    const VERSION = '1.2.0';
     const STYLE_ID = 'remia-youtube-performance-style';
+    const RUNTIME_ATTR = 'data-remia-yt-perf-runtime';
+    const SCROLL_ATTR = 'data-remia-yt-scrolling';
+    const THUMBNAILS = [
+        ':is(ytd-browse, ytd-search) :is(ytd-thumbnail, yt-thumbnail-view-model) img',
+        'ytd-watch-flexy #related :is(ytd-thumbnail, yt-thumbnail-view-model) img'
+    ];
     const rules = [];
     const containedSelectors = [];
     const supportsContentVisibility = typeof CSS !== 'undefined' &&
@@ -150,10 +166,136 @@
             '}'
         );
     }
+    //
+    if (CONFIG.reduceThumbnailTransitionsWhileScrolling) {
+        rules.push(THUMBNAILS.map(selector =>
+            'html[' + SCROLL_ATTR + '] ' + selector
+        ).join(',\n') + ' {\n' +
+            '  transition-property: none !important;\n' +
+            '}'
+        );
+    }
     // Screen-only rules leave the page's print layout alone.
     const cssText = rules.length
         ? '@media screen {\n' + rules.join('\n') + '\n}\n'
         : '';
+    //
+    function startRuntime() {
+        if (!CONFIG.asyncThumbnailDecoding &&
+            !CONFIG.reduceThumbnailTransitionsWhileScrolling) return;
+        const root = document.documentElement;
+        if (root.hasAttribute(RUNTIME_ATTR)) return;
+        root.setAttribute(RUNTIME_ATTR, VERSION);
+        let suspended = false;
+        let navigating = false;
+        let scrolling = false;
+        let scrollTimer = null;
+        let decodeJob = null;
+        let decodeUsesIdle = false;
+        let lateTimer = null;
+        //
+        function active() {
+            return !suspended && !navigating && !document.hidden;
+        }
+        function clearScrolling() {
+            if (scrollTimer !== null) window.clearTimeout(scrollTimer);
+            scrollTimer = null;
+            scrolling = false;
+            root.removeAttribute(SCROLL_ATTR);
+        }
+        function stopJobs() {
+            clearScrolling();
+            if (decodeJob !== null) {
+                if (decodeUsesIdle) window.cancelIdleCallback(decodeJob);
+                else window.clearTimeout(decodeJob);
+            }
+            decodeJob = null;
+            if (lateTimer !== null) window.clearTimeout(lateTimer);
+            lateTimer = null;
+        }
+        function decodeThumbnails() {
+            const images = document.querySelectorAll(THUMBNAILS.join(','));
+            const limit = Math.min(images.length, CONFIG.maxThumbnailImagesPerPass);
+            let leading = 0;
+            let changed = 0;
+            for (let i = 0; i < limit; i++) {
+                const image = images[i];
+                if (!image.isConnected || image.closest(
+                    '[hidden], [aria-hidden="true"], #movie_player, ytd-player, ytd-miniplayer'
+                )) continue;
+                if (leading++ < CONFIG.thumbnailSkipFirst) continue;
+                if (image.hasAttribute('decoding') ||
+                    (image.getAttribute('fetchpriority') || '').trim().toLowerCase() === 'high' ||
+                    !(image.getAttribute('src') || image.getAttribute('srcset'))) continue;
+                image.setAttribute('decoding', 'async');
+                changed++;
+            }
+            // No geometry reads: inspecting skipped descendants can force layout.
+            // This hint does not re-decode an already displayed image.
+            if (CONFIG.debug) console.info('[Remia YT Perf] Thumbnail hints.', { changed });
+        }
+        function queueDecode() {
+            if (!CONFIG.asyncThumbnailDecoding || !active() || decodeJob !== null) return;
+            decodeUsesIdle = typeof window.requestIdleCallback === 'function' &&
+                typeof window.cancelIdleCallback === 'function';
+            const run = () => {
+                decodeJob = null;
+                if (active()) decodeThumbnails();
+            };
+            decodeJob = decodeUsesIdle
+                ? window.requestIdleCallback(run, { timeout: 1000 })
+                : window.setTimeout(run, 50);
+        }
+        function activate() {
+            if (!active() || document.readyState === 'loading') return;
+            queueDecode();
+            if (!CONFIG.asyncThumbnailDecoding) return;
+            if (lateTimer !== null) window.clearTimeout(lateTimer);
+            lateTimer = window.setTimeout(() => {
+                lateTimer = null;
+                queueDecode();
+            }, CONFIG.thumbnailHydrationDelayMs);
+        }
+        function onScroll() {
+            if (!active()) return;
+            if (!scrolling) {
+                scrolling = true;
+                root.setAttribute(SCROLL_ATTR, '');
+            }
+            if (scrollTimer !== null) window.clearTimeout(scrollTimer);
+            scrollTimer = window.setTimeout(clearScrolling, CONFIG.scrollIdleMs);
+        }
+        //
+        if (CONFIG.reduceThumbnailTransitionsWhileScrolling) {
+            document.addEventListener('scroll', onScroll, { passive: true, capture: true });
+            document.addEventListener('scrollend', clearScrolling, { capture: true });
+        }
+        document.addEventListener('yt-navigate-start', () => {
+            navigating = true;
+            stopJobs();
+        }, true);
+        document.addEventListener('yt-navigate-finish', () => {
+            navigating = false;
+            activate();
+        }, true);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) stopJobs();
+            else activate();
+        });
+        window.addEventListener('pagehide', () => {
+            suspended = true;
+            stopJobs();
+        });
+        window.addEventListener('pageshow', event => {
+            if (!event.persisted) return;
+            suspended = false;
+            navigating = false;
+            activate();
+        });
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', activate, { once: true });
+        } else activate();
+    }
     //
     function installStyle() {
         const parent = document.head || document.documentElement;
@@ -186,14 +328,18 @@
         }
         return true;
     }
-    // CSS automatically matches new SPA content. No polling, persistent
-    // DOM observers, layout measurements, or browser API replacements.
-    if (installStyle()) return;
+    // CSS matches SPA content automatically. Optional runtime work is bounded
+    // and event-driven, without DOM observers or browser API replacements.
+    if (installStyle()) {
+        startRuntime();
+        return;
+    }
     //
     function onReady() {
         if (!installStyle()) return;
         document.removeEventListener('readystatechange', onReady);
         document.removeEventListener('DOMContentLoaded', onReady);
+        startRuntime();
     }
     document.addEventListener('readystatechange', onReady);
     document.addEventListener('DOMContentLoaded', onReady, { once: true });
