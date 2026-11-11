@@ -1,105 +1,83 @@
 /// remia-youtube-full-titles.js
 /// world ISOLATED
 /*
- * Remia YouTube Full Titles v1.0.0 (2026-11-11)
- * Smaller, fully wrapped titles on desktop YouTube video cards.
- * Supports legacy renderers and newer yt-lockup-view-model cards.
- *
- * INSTALL:
- * 1. Host this exact file as raw text over HTTPS.
- * 2. Add its URL to uBO Advanced settings > userResourcesLocation.
- * 3. Add to My filters: www.youtube.com##+js(remia-youtube-full-titles)
- * 4. Apply changes and reload YouTube.
- *
- * Keep the resource free of empty lines. Use comment-only separators.
- * CSS only: no polling, DOM observers, or page API replacements.
- * Full titles require taller cards when the available width is small.
+ * Remia YouTube Full Titles v1.1.0 (2026-11-11)
+ * Smaller titles with unrestricted wrapping on desktop YouTube.
+ * Filter: www.youtube.com##+js(remia-youtube-full-titles)
+ * Refresh the raw resource after replacing this file.
+ * No empty lines inside this uBO resource.
  */
 (function () {
     'use strict';
     const CONFIG = {
-        fontSizePx: 12,
-        lineHeight: 1.35,
-        expandCards: true
+        fontSizePx: 10,
+        lineHeight: 1.3,
+        expandCards: true,
+        debug: false
     };
-    //
     if (window.top !== window.self) return;
-    if (location.hostname !== 'www.youtube.com' &&
-        location.hostname !== 'youtube.com') return;
+    if (!/^(?:www\.)?youtube\.com$/.test(location.hostname)) return;
     //
+    const VERSION = '1.1.0';
     const STYLE_ID = 'remia-youtube-full-titles-style';
-    const fontSize = Math.min(24, Math.max(8, Number(CONFIG.fontSizePx) || 12));
-    const lineHeight = Math.min(2, Math.max(1.1, Number(CONFIG.lineHeight) || 1.35));
-    const cards = ':is(ytd-rich-item-renderer, ytd-rich-grid-media, ' +
-        'ytd-grid-video-renderer, ytd-video-renderer, ytd-compact-video-renderer, ' +
-        'ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, ' +
-        'yt-lockup-view-model)';
-    const modernTitle = ':is(.ytLockupMetadataViewModelTitle, ' +
-        '.ytLockupMetadataViewModelHeadingReset, ' +
-        '.yt-lockup-metadata-view-model__title, ' +
-        '.yt-lockup-metadata-view-model-wiz__title)';
-    const titles = [
-        cards + ' :is(#video-title, #video-title-link)',
-        cards + ' ' + modernTitle,
-        'yt-lockup-metadata-view-model ' + modernTitle,
-        ':is(ytd-rich-grid-media, ytd-grid-video-renderer, ' +
-            'ytd-video-renderer, ytd-compact-video-renderer) h3'
-    ];
-    const textNodes = titles.map(selector => selector +
-        ' :is(.ytAttributedStringHost, .yt-core-attributed-string, yt-formatted-string)');
+    const MARKER = 'data-remia-full-titles';
+    const fontSize = Math.min(24, Math.max(8, Number(CONFIG.fontSizePx) || 10));
+    const lineHeight = Math.min(2, Math.max(1.1, Number(CONFIG.lineHeight) || 1.3));
+    // Group IDs and modern classes together so compact-layout CSS loses priority.
+    const title = ':is(#video-title, #video-title-link, ' +
+        '.ytLockupMetadataViewModelTitle, .ytLockupMetadataViewModelHeadingReset, ' +
+        '.yt-lockup-metadata-view-model__title, .yt-lockup-metadata-view-model-wiz__title, ' +
+        'ytd-rich-grid-media h3, ytd-grid-video-renderer h3, ' +
+        'ytd-video-renderer h3, ytd-compact-video-renderer h3)' +
+        ':not([hidden]):not([aria-hidden="true"])';
+    const scope = 'html:root:root:root ';
     const wrappers = [
-        cards + ' :is(.ytLockupMetadataViewModelTextContainer, ' +
-            '.yt-lockup-metadata-view-model__text-container, ' +
-            '.yt-lockup-metadata-view-model-wiz__text-container)',
-        'yt-lockup-metadata-view-model .ytLockupMetadataViewModelTextContainer',
-        'yt-lockup-metadata-view-model .yt-lockup-metadata-view-model__text-container',
-        'yt-lockup-metadata-view-model .yt-lockup-metadata-view-model-wiz__text-container',
-        'ytd-rich-grid-media #meta',
-        'ytd-grid-video-renderer #meta',
-        'ytd-video-renderer #meta',
+        '.ytLockupMetadataViewModelTextContainer',
+        '.yt-lockup-metadata-view-model__text-container',
+        '.yt-lockup-metadata-view-model-wiz__text-container',
+        ':is(ytd-rich-grid-media, ytd-grid-video-renderer, ' +
+            'ytd-video-renderer, ytd-compact-video-renderer) h3',
+        ':is(ytd-rich-grid-media, ytd-grid-video-renderer, ytd-video-renderer) #meta',
         'ytd-compact-video-renderer #metadata'
     ];
-    function scoped(selectors) {
-        return selectors.map(selector => 'html:root ytd-app ' + selector).join(',\n');
-    }
-    // Remove clamping on headings, links, and attributed text independently.
+    const cards = ':is(ytd-rich-item-renderer, ytd-rich-grid-media, ' +
+        'ytd-grid-video-renderer, ytd-video-renderer, ytd-compact-video-renderer, ' +
+        'ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer, yt-lockup-view-model)';
+    const important = list => list.map(value => value + ' !important').join('; ');
+    const textStyle = important([
+        'font-size: ' + fontSize + 'px',
+        'line-height: ' + lineHeight,
+        '-webkit-line-clamp: unset',
+        'line-clamp: unset',
+        'white-space: normal',
+        'overflow-wrap: anywhere',
+        'word-break: normal',
+        'text-overflow: clip',
+        'overflow: visible',
+        'height: auto',
+        'block-size: auto',
+        'max-height: none',
+        'max-block-size: none',
+        'min-width: 0',
+        'max-width: 100%'
+    ]);
+    const sizeStyle = important([
+        'height: auto', 'block-size: auto',
+        'max-height: none', 'max-block-size: none', 'min-width: 0'
+    ]);
     const rules = [
-        scoped(titles.concat(textNodes)) + ' {\n' +
-        '  font-size: ' + fontSize + 'px !important;\n' +
-        '  line-height: ' + lineHeight + ' !important;\n' +
-        '  display: block !important;\n' +
-        '  -webkit-line-clamp: unset !important;\n' +
-        '  line-clamp: unset !important;\n' +
-        '  -webkit-box-orient: initial !important;\n' +
-        '  white-space: normal !important;\n' +
-        '  overflow-wrap: anywhere !important;\n' +
-        '  word-break: normal !important;\n' +
-        '  text-overflow: clip !important;\n' +
-        '  overflow: visible !important;\n' +
-        '  height: auto !important;\n' +
-        '  block-size: auto !important;\n' +
-        '  max-height: none !important;\n' +
-        '  max-block-size: none !important;\n' +
-        '  min-width: 0 !important;\n' +
-        '  max-width: 100% !important;\n' +
-        '}',
-        scoped(wrappers) + ' {\n' +
-        '  min-width: 0 !important;\n' +
-        '  height: auto !important;\n' +
-        '  max-height: none !important;\n' +
-        '  max-block-size: none !important;\n' +
-        '}'
+        scope + title + ' { display: block !important; ' + textStyle + '; }',
+        scope + title + ' :is(a, span, yt-formatted-string) { ' + textStyle + '; }',
+        wrappers.map(selector => scope + selector).join(',\n') +
+            ' { ' + sizeStyle + '; overflow: visible !important; }'
     ];
-    // Preserve thumbnail dimensions, grid column widths, and menu controls.
     if (CONFIG.expandCards) {
-        rules.push('html:root ytd-app ' + cards + ' {\n' +
-            '  height: auto !important;\n' +
-            '  max-height: none !important;\n' +
-            '  max-block-size: none !important;\n' +
-            '}'
-        );
+        rules.push(scope + cards + ' { ' + sizeStyle +
+            '; aspect-ratio: auto !important; }');
     }
     const cssText = '@media screen {\n' + rules.join('\n') + '\n}\n';
+    const alreadyInstalled = document.documentElement &&
+        document.documentElement.getAttribute(MARKER) === VERSION;
     //
     function install() {
         const parent = document.head || document.documentElement;
@@ -114,15 +92,19 @@
         } else if (style.textContent !== cssText) {
             style.textContent = cssText;
         }
+        document.documentElement.setAttribute(MARKER, VERSION);
+        if (CONFIG.debug) console.info('[Remia Full Titles]', VERSION,
+            'CSS ready; matched:', document.querySelectorAll(title).length);
         return true;
     }
-    // Selectors automatically apply to new cards during YouTube SPA navigation.
-    if (install()) return;
     function onReady() {
         if (!install()) return;
         document.removeEventListener('readystatechange', onReady);
-        document.removeEventListener('DOMContentLoaded', onReady);
     }
-    document.addEventListener('readystatechange', onReady);
-    document.addEventListener('DOMContentLoaded', onReady, { once: true });
+    if (!install()) document.addEventListener('readystatechange', onReady);
+    if (alreadyInstalled) return;
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', onReady, { once: true });
+    }
+    document.addEventListener('yt-navigate-finish', install, true);
 })();
