@@ -1,16 +1,14 @@
 /// remia-global-performance.js
 /// world ISOLATED
 /*
- * Remia Global Performance v2.1.0 (2026-11-09)
- * uBlock Origin custom scriptlet for Firefox / Zen Browser.
- * Filter: /^.+$/##+js(remia-global-performance)
- * Host the raw file over HTTPS and add its URL to userResourcesLocation.
- * IMPORTANT: no empty or whitespace-only lines inside this resource.
- * Use comment-only lines as separators; uBO ends resources at blank lines.
- *
- * Bounded rendering optimization for simple, repeated article cards.
- * Media attributes are hints; late changes cannot undo started requests.
- * No guaranteed reduction in JS downloads, RAM, or page loading time.
+ * Remia Global Performance v2.2.0 (2026-11-14)
+ * uBlock Origin custom resource for Firefox / Zen Browser.
+ * My filters: /^.+$/##+js(remia-global-performance)
+ * Put the HTTPS raw-file URL in userResourcesLocation.
+ * Keep these two resource headers and do not insert blank lines.
+ * This is a resource file, not a userscript or a filter list.
+ * Media hints cannot undo requests which have already started.
+ * Rendering savings depend on the page; no RAM or speed guarantee.
  */
 (() => {
     'use strict';
@@ -27,15 +25,14 @@
         maxArticlesPerPass: 64,
         maxOptimizedArticlesTotal: 120,
         maxObservedFeeds: 2,
-        // Counts inspected nodes, including nodes that are ignored.
         maxDynamicItemsToCheck: 80,
         observerLifetimeMs: 90000,
         offscreenViewportMultiplier: 1.5,
         idleTimeoutMs: 1400,
+        latePassDelayMs: 1800,
         debug: false,
         excludedDomains: [
-            // Use the separate YouTube scriptlet on this domain.
-            'youtube.com',
+            'youtube.com', 'youtu.be',
             'accounts.google.com', 'mail.google.com',
             'docs.google.com', 'drive.google.com',
             'paypal.com', 'stripe.com',
@@ -43,61 +40,77 @@
             'figma.com'
         ]
     };
-    //
+    // Only the top-level HTML document is eligible.
     try {
         if (window !== window.top) return;
     } catch (_) { return; }
-    const VERSION = '2.1.0';
+    const VERSION = '2.2.0';
     const OWNER = 'data-remia-global-performance';
+    const STATUS = 'data-remia-global-performance-status';
     const ITEM = 'data-remia-global-performance-item';
     const SIZE = '--remia-global-block-size';
     const STYLE_ID = 'remia-global-performance-style';
     const ARTICLE = 'article, [role="article"]';
-    const COMPLEX = 'video, audio, canvas, iframe, form, input, textarea, ' +
-        'select, details, [contenteditable]:not([contenteditable="false"]), ' +
-        '[role="textbox"], [role="dialog"], [role="menu"], [popover]';
+    const COMPLEX = 'article, [role="article"], video, audio, canvas, iframe, ' +
+        'object, embed, form, input, textarea, select, button, details, dialog, ' +
+        '[contenteditable]:not([contenteditable="false"]), [role="textbox"], ' +
+        '[role="dialog"], [role="menu"], [role="button"], [aria-live], [popover]';
     const canContain = typeof CSS !== 'undefined' &&
         typeof CSS.supports === 'function' &&
         CSS.supports('content-visibility', 'auto') &&
         CSS.supports('contain-intrinsic-block-size', 'auto 300px');
-    const stats = { images: 0, decoding: 0, iframes: 0, articles: 0, feeds: 0 };
-    const optimized = new WeakSet();
+    const stats = { passes: 0, images: 0, decoding: 0, iframes: 0, articles: 0, feeds: 0 };
+    const managed = new Map();
+    const articleQueue = new Map();
     const feedObservers = new Map();
-    const dynamicQueue = new Map();
+    let root = null;
     let sheetElement = null;
+    let styleState = 'not-needed';
+    let lastError = '';
     let disposed = false;
-    let mediaPending = true;
-    let discoveryPending = true;
+    let finalized = false;
     let watchingClosed = false;
     let dynamicChecked = 0;
+    let mediaPending = true;
+    let discoveryPending = true;
     let idleHandle = null;
     let idleUsesRIC = false;
     let lateTimer = null;
     let observerStopTimer = null;
     let waitingForVisibility = false;
-    //
-    function allowed() {
-        if (!/^https?:$/.test(location.protocol)) return false;
+    // Diagnostics live in DOM attributes, accessible across isolated worlds.
+    function publish(state, reason = '') {
+        if (!root) return;
+        const report = {
+            version: VERSION, state, reason, ...stats,
+            canContain, style: styleState,
+            observers: feedObservers.size, queued: articleQueue.size,
+            dynamicChecked, error: lastError
+        };
+        root.setAttribute(STATUS, JSON.stringify(report));
+        if (CONFIG.debug) console.info('[Remia Global]', report);
+    }
+    function exclusionReason() {
+        if (!/^https?:$/.test(location.protocol)) return 'protocol';
+        if (document.contentType !== 'text/html') return 'non-html';
         const host = location.hostname.toLowerCase();
         if (CONFIG.excludedDomains.some(domain =>
             host === domain || host.endsWith('.' + domain)
-        )) return false;
-        if (/(?:^|\/)(?:login|log-in|signin|sign-in|checkout|payment|billing|auth)(?:\/|$)/i
-            .test(location.pathname)) return false;
-        return !document.querySelector('input[type="password"]');
-    }
-    function log(message, error) {
-        if (CONFIG.debug) console.info('[Remia Global ' + VERSION + ']',
-            message, error || { ...stats });
+        )) return 'excluded-domain';
+        if (/(?:^|\/)(?:login|log-in|signin|sign-in|checkout|payment|billing|auth)(?:[/.;]|$)/i
+            .test(location.pathname)) return 'sensitive-path';
+        return document.querySelector('input[type="password"]') ? 'password-field' : '';
     }
     function farOutside(rect, cutoff) {
         return rect.top > cutoff || rect.bottom < -cutoff;
     }
-    //
     function ensureStyle() {
-        if (sheetElement && sheetElement.isConnected) return true;
-        if (document.getElementById(STYLE_ID)) return false;
-        const selector = ':is(article, [role="article"])[' + ITEM + ']';
+        if (sheetElement && sheetElement.isConnected && sheetElement.sheet) return true;
+        if (document.getElementById(STYLE_ID)) {
+            styleState = 'id-conflict';
+            return false;
+        }
+        const selector = ':is(article, [role="article"])[' + ITEM + '="' + VERSION + '"]';
         const style = document.createElement('style');
         style.id = STYLE_ID;
         style.textContent = '@media screen {\n' + selector + ' {\n' +
@@ -106,16 +119,19 @@
             (CONFIG.releaseContainmentOnInteraction
                 ? selector + ':is(:hover, :focus-within) {\n' +
                   'content-visibility: visible;\n}\n' : '') + '}';
-        (document.head || document.documentElement).appendChild(style);
-        // A site may reject injected styles. Leave its article layout alone.
-        if (!style.sheet || !style.sheet.cssRules.length) {
-            style.remove();
-            return false;
-        }
-        sheetElement = style;
-        return true;
+        try {
+            (document.head || root).appendChild(style);
+            if (style.sheet && style.sheet.cssRules.length) {
+                sheetElement = style;
+                styleState = 'ready';
+                return true;
+            }
+        } catch (_) { /* A blocked stylesheet must not stop media hints. */ }
+        style.remove();
+        styleState = 'unavailable';
+        return false;
     }
-    //
+    // Only missing attributes on distant, not-yet-complete media are changed.
     function collectMedia(cutoff) {
         const selectors = [];
         if (CONFIG.lazyImages) selectors.push('img:not([loading])');
@@ -128,16 +144,19 @@
             const element = nodes[i];
             const image = element.localName === 'img';
             if ((element.getAttribute('fetchpriority') || '').trim().toLowerCase() === 'high' ||
-                element.closest('header, nav, [role="banner"]')) continue;
+                element.closest('header, nav, form, [role="banner"], [role="dialog"]')) continue;
             if (image) {
-                if (element.complete ||
-                    !(element.getAttribute('src') || element.getAttribute('srcset'))) continue;
+                const hasSource = element.currentSrc || element.getAttribute('src') ||
+                    element.getAttribute('srcset') ||
+                    (element.parentElement && element.parentElement.localName === 'picture' &&
+                        element.parentElement.querySelector('source[srcset]'));
+                if (element.complete || !hasSource) continue;
             } else if (!element.getAttribute('src') || element.hasAttribute('srcdoc') ||
-                /\bautoplay\b/i.test(element.getAttribute('allow') || '')) continue;
+                /\b(?:autoplay|camera|microphone|payment|display-capture)\b/i
+                    .test(element.getAttribute('allow') || '')) continue;
             const lazy = (image ? CONFIG.lazyImages : CONFIG.lazyIframes) &&
                 !element.hasAttribute('loading');
-            const decode = image && CONFIG.asyncImageDecoding &&
-                !element.hasAttribute('decoding');
+            const decode = image && CONFIG.asyncImageDecoding && !element.hasAttribute('decoding');
             if (!lazy && !decode) continue;
             const rect = element.getBoundingClientRect();
             if (rect.width >= 4 && rect.height >= 4 && farOutside(rect, cutoff)) {
@@ -159,7 +178,7 @@
             }
         }
     }
-    //
+    // Discovery is deliberately limited to repeated direct article siblings.
     function discoverFeeds() {
         const nodes = document.querySelectorAll(
             'main article, [role="main"] article, ' +
@@ -174,64 +193,66 @@
             groups.get(parent).push(article);
         }
         for (const [parent, articles] of groups) {
-            if (articles.length < CONFIG.minimumArticlesPerFeed) groups.delete(parent);
+            if (articles.length < CONFIG.minimumArticlesPerFeed) {
+                groups.delete(parent);
+                continue;
+            }
+            for (const article of articles) enqueue(article, parent);
         }
         return groups;
     }
-    function collectArticles(groups, cutoff) {
+    function enqueue(article, parent) {
+        if (!managed.has(article) && !article.hasAttribute(ITEM) &&
+            articleQueue.size < CONFIG.maxArticlesToCheck) articleQueue.set(article, parent);
+    }
+    function collectArticles(cutoff) {
         const pending = [];
         let checked = 0;
-        for (const [parent, articles] of groups) {
-            for (const article of articles) {
-                if (optimized.has(article) || article.hasAttribute(ITEM)) continue;
-                if (checked++ >= CONFIG.maxArticlesPerPass ||
-                    stats.articles + pending.length >= CONFIG.maxOptimizedArticlesTotal) {
-                    return pending;
-                }
-                if (!article.isConnected || article.parentElement !== parent ||
-                    article.isContentEditable || article.matches(':hover, :focus-within') ||
-                    article.querySelector(COMPLEX)) continue;
-                if (article.style.getPropertyValue(SIZE) ||
-                    article.style.getPropertyValue('content-visibility') ||
-                    article.style.getPropertyValue('contain-intrinsic-block-size')) continue;
-                const rect = article.getBoundingClientRect();
-                if (!farOutside(rect, cutoff) || rect.width < 240 ||
-                    rect.height < 110 || rect.height > 1500) continue;
-                const css = window.getComputedStyle(article);
-                if (css.contentVisibility !== 'visible' || css.contain !== 'none' ||
-                    css.containIntrinsicBlockSize !== 'none' ||
-                    !['static', 'relative'].includes(css.position) ||
-                    ['none', 'contents', 'inline'].includes(css.display) ||
-                    css.writingMode !== 'horizontal-tb' || css.transform !== 'none') continue;
-                const edges = ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth']
-                    .reduce((sum, key) => sum + (parseFloat(css[key]) || 0), 0);
-                const usedHeight = parseFloat(css.height);
-                const innerHeight = Number.isFinite(usedHeight)
-                    ? usedHeight - (css.boxSizing === 'border-box' ? edges : 0)
-                    : rect.height - edges;
-                if (innerHeight > 0) pending.push({ article, parent,
-                    height: Math.max(1, Math.round(innerHeight)) });
-            }
+        for (const [article, parent] of articleQueue) {
+            if (checked >= CONFIG.maxArticlesPerPass ||
+                stats.articles + pending.length >= CONFIG.maxOptimizedArticlesTotal) break;
+            checked++;
+            articleQueue.delete(article);
+            if (!article.isConnected || article.parentElement !== parent ||
+                managed.has(article) || article.hasAttribute(ITEM) || article.isContentEditable ||
+                article.matches(':hover, :focus-within') || article.querySelector(COMPLEX)) continue;
+            if (article.style.getPropertyValue(SIZE) ||
+                article.style.getPropertyValue('content-visibility') ||
+                article.style.getPropertyValue('contain-intrinsic-block-size')) continue;
+            const rect = article.getBoundingClientRect();
+            if (!farOutside(rect, cutoff) || rect.width < 240 ||
+                rect.height < 110 || rect.height > 1500) continue;
+            const css = window.getComputedStyle(article);
+            if (css.contentVisibility !== 'visible' || css.contain !== 'none' ||
+                css.containIntrinsicBlockSize !== 'none' ||
+                (css.containerType && css.containerType !== 'normal') ||
+                !['static', 'relative'].includes(css.position) ||
+                !['block', 'flow-root', 'flex', 'grid'].includes(css.display) ||
+                css.writingMode !== 'horizontal-tb' || css.transform !== 'none') continue;
+            const edges = ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth']
+                .reduce((sum, key) => sum + (parseFloat(css[key]) || 0), 0);
+            const usedHeight = parseFloat(css.height);
+            const height = Number.isFinite(usedHeight)
+                ? usedHeight - (css.boxSizing === 'border-box' ? edges : 0)
+                : rect.height - edges;
+            if (height > 0) pending.push({ article, parent, size: Math.max(1, Math.round(height)) + 'px' });
         }
         return pending;
     }
     function applyArticles(pending) {
-        for (const { article, parent, height } of pending) {
+        for (const { article, parent, size } of pending) {
             if (!article.isConnected || article.parentElement !== parent ||
-                optimized.has(article)) continue;
-            article.style.setProperty(SIZE, height + 'px');
-            article.setAttribute(ITEM, '');
-            optimized.add(article);
+                managed.has(article) || article.hasAttribute(ITEM)) continue;
+            article.style.setProperty(SIZE, size);
+            article.setAttribute(ITEM, VERSION);
+            managed.set(article, size);
             stats.articles++;
         }
     }
-    //
-    function closeFeeds(discardQueue = true) {
+    function stopWatching() {
         watchingClosed = true;
         for (const observer of feedObservers.values()) observer.disconnect();
         feedObservers.clear();
-        if (!discardQueue) return;
-        dynamicQueue.clear();
         if (observerStopTimer !== null) window.clearTimeout(observerStopTimer);
         observerStopTimer = null;
     }
@@ -241,38 +262,40 @@
             feedObservers.size >= CONFIG.maxObservedFeeds ||
             typeof MutationObserver === 'undefined') return;
         const observer = new MutationObserver(records => {
-            if (disposed || !parent.isConnected) {
+            if (disposed) return;
+            if (!parent.isConnected) {
                 observer.disconnect();
                 feedObservers.delete(parent);
+                publish('idle');
                 return;
             }
             recordsLoop: for (const record of records) {
-                // Removal-only records also consume the inspection budget.
-                if (!record.addedNodes.length) dynamicChecked++;
+                if (!record.addedNodes.length && dynamicChecked < CONFIG.maxDynamicItemsToCheck) {
+                    dynamicChecked++;
+                }
                 for (const node of record.addedNodes) {
                     if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck) break recordsLoop;
                     dynamicChecked++;
-                    if (node.nodeType === 1 && node.matches(ARTICLE) &&
-                        dynamicQueue.size < CONFIG.maxArticlesPerPass) {
-                        dynamicQueue.set(node, parent);
-                    }
+                    if (node.nodeType === 1 && node.matches(ARTICLE)) enqueue(node, parent);
                 }
                 if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck) break;
             }
-            if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck) closeFeeds(false);
-            if (dynamicQueue.size) schedule();
-            else if (watchingClosed) closeFeeds();
+            if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck) stopWatching();
+            if (articleQueue.size) schedule();
+            else publish(feedObservers.size ? 'watching' : 'idle');
         });
         observer.observe(parent, { childList: true });
         feedObservers.set(parent, observer);
         stats.feeds++;
         if (observerStopTimer === null) {
-            observerStopTimer = window.setTimeout(() => closeFeeds(), CONFIG.observerLifetimeMs);
+            observerStopTimer = window.setTimeout(() => {
+                stopWatching();
+                publish('idle', 'watch-window-ended');
+            }, CONFIG.observerLifetimeMs);
         }
     }
-    //
     function onVisible() {
-        if (document.hidden) return;
+        if (document.hidden || disposed) return;
         document.removeEventListener('visibilitychange', onVisible);
         waitingForVisibility = false;
         schedule();
@@ -284,6 +307,7 @@
                 document.addEventListener('visibilitychange', onVisible);
                 waitingForVisibility = true;
             }
+            publish('waiting', 'hidden-document');
             return;
         }
         idleUsesRIC = typeof window.requestIdleCallback === 'function' &&
@@ -295,42 +319,53 @@
     function runWork() {
         idleHandle = null;
         if (disposed) return;
-        if (!allowed()) { shutdown(true); return; }
         if (document.hidden) { schedule(); return; }
         try {
+            const reason = exclusionReason();
+            if (reason) { finish('skipped', reason); return; }
             const feedEnabled = CONFIG.optimizeLongArticleFeeds && canContain &&
                 stats.articles < CONFIG.maxOptimizedArticlesTotal;
-            const groups = feedEnabled && discoveryPending ? discoverFeeds() : new Map();
-            const discoveredParents = [...groups.keys()];
+            const groups = discoveryPending && feedEnabled ? discoverFeeds() : new Map();
             discoveryPending = false;
-            for (const [article, parent] of dynamicQueue) {
-                if (!feedEnabled || article.parentElement !== parent) continue;
-                if (!groups.has(parent)) groups.set(parent, []);
-                if (!groups.get(parent).includes(article)) groups.get(parent).push(article);
-            }
-            dynamicQueue.clear();
-            const styleReady = groups.size > 0 && ensureStyle();
+            if (!feedEnabled) articleQueue.clear();
+            const styleNeeded = feedEnabled && (articleQueue.size > 0 || groups.size > 0);
+            const styleReady = styleNeeded && ensureStyle();
             const cutoff = Math.max(900,
                 (window.innerHeight || 800) * CONFIG.offscreenViewportMultiplier);
-            // Complete ALL geometry reads before applying media/article changes.
+            // Batch geometry reads before media and article writes.
             const media = mediaPending ? collectMedia(cutoff) : [];
             mediaPending = false;
-            const articles = styleReady ? collectArticles(groups, cutoff) : [];
+            const articles = styleReady ? collectArticles(cutoff) : [];
+            if (!styleReady) articleQueue.clear();
+            if (styleNeeded && !styleReady) stopWatching();
             applyMedia(media);
             applyArticles(articles);
-            if (styleReady) for (const parent of discoveredParents) watchFeed(parent);
-            if (dynamicChecked >= CONFIG.maxDynamicItemsToCheck ||
-                stats.articles >= CONFIG.maxOptimizedArticlesTotal) closeFeeds();
-            log('Pass finished');
+            if (styleReady) for (const parent of groups.keys()) watchFeed(parent);
+            if (stats.articles >= CONFIG.maxOptimizedArticlesTotal) {
+                articleQueue.clear();
+                stopWatching();
+            }
+            stats.passes++;
+            publish(feedObservers.size ? 'watching' : 'idle');
+            if (articleQueue.size) schedule();
         } catch (error) {
-            closeFeeds();
-            log('Pass stopped', error);
+            lastError = String(error && error.message || error).slice(0, 180);
+            finish('error', 'runtime-error');
+            console.warn('[Remia Global ' + VERSION + ']', error);
         }
     }
-    //
-    function shutdown(restoreStyles = false) {
+    function armLatePass() {
+        lateTimer = window.setTimeout(() => {
+            lateTimer = null;
+            mediaPending = true;
+            discoveryPending = true;
+            schedule();
+        }, CONFIG.latePassDelayMs);
+    }
+    function cancelWork() {
         disposed = true;
-        closeFeeds();
+        stopWatching();
+        articleQueue.clear();
         if (idleHandle !== null) {
             if (idleUsesRIC) window.cancelIdleCallback(idleHandle);
             else window.clearTimeout(idleHandle);
@@ -340,39 +375,54 @@
         lateTimer = null;
         document.removeEventListener('visibilitychange', onVisible);
         waitingForVisibility = false;
-        if (!restoreStyles) return;
-        for (const article of document.querySelectorAll('[' + ITEM + ']')) {
-            article.removeAttribute(ITEM);
-            article.style.removeProperty(SIZE);
+    }
+    function finish(state, reason) {
+        finalized = true;
+        cancelWork();
+        for (const [article, size] of managed) {
+            if (article.getAttribute(ITEM) === VERSION) article.removeAttribute(ITEM);
+            if (article.style.getPropertyValue(SIZE) === size) article.style.removeProperty(SIZE);
         }
+        managed.clear();
         if (sheetElement) sheetElement.remove();
-        document.documentElement.removeAttribute(OWNER);
+        sheetElement = null;
+        if (styleState === 'ready') styleState = 'removed';
         window.removeEventListener('pagehide', onPageHide);
         window.removeEventListener('pageshow', onPageShow);
+        publish(state, reason);
     }
-    function onPageHide() { shutdown(); }
+    function onPageHide() {
+        if (finalized) return;
+        cancelWork();
+        publish('suspended');
+    }
     function onPageShow(event) {
-        if (!event.persisted) return;
+        if (!event.persisted || finalized) return;
         disposed = false;
         watchingClosed = false;
         dynamicChecked = 0;
+        mediaPending = true;
         discoveryPending = true;
         schedule();
+        armLatePass();
     }
     function start() {
-        if (!allowed()) return;
-        const root = document.documentElement;
+        root = document.documentElement;
         if (!root || root.hasAttribute(OWNER)) return;
         root.setAttribute(OWNER, VERSION);
-        window.addEventListener('pagehide', onPageHide);
-        window.addEventListener('pageshow', onPageShow);
-        schedule();
-        // One additional feed discovery for late hydration; no URL polling.
-        lateTimer = window.setTimeout(() => {
-            lateTimer = null;
-            discoveryPending = true;
+        try {
+            const reason = exclusionReason();
+            if (reason) { finish('skipped', reason); return; }
+            window.addEventListener('pagehide', onPageHide);
+            window.addEventListener('pageshow', onPageShow);
+            publish('ready');
             schedule();
-        }, 1800);
+            armLatePass();
+        } catch (error) {
+            lastError = String(error && error.message || error).slice(0, 180);
+            finish('error', 'startup-error');
+            console.warn('[Remia Global ' + VERSION + ']', error);
+        }
     }
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', start, { once: true });
