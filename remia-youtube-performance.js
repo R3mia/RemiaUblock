@@ -3,19 +3,19 @@
 /*
  * Remia's YouTube Performance — uBlock Origin custom scriptlet
  * Target: desktop YouTube on Firefox / Zen Browser
- * Version: 1.4.0 (2026-11-09)
+ * Version: 1.5.0 (2026-11-14)
  *
  * INSTALL:
  * 1. Host this file as raw text over HTTPS.
  * 2. Add the raw URL to uBO > Advanced settings > userResourcesLocation.
- * 3. Add to My filters: www.youtube.com##+js(remia-youtube-performance)
+ * 3. Add to My filters: youtube.com##+js(remia-youtube-performance)
  * 4. Refresh the custom resource in uBO and reload YouTube.
  *
  * RESOURCE FORMAT: do not insert empty or whitespace-only lines inside
  * this resource. uBO treats them as the end of its JavaScript body.
  * Use a comment-only line to separate sections instead.
  *
- * CSS and bounded image hints; telemetry rules live in the paired filters.
+ * CSS and bounded image hints; this resource does not block network requests.
  * Player-poster priority uses hints; an LCP improvement is not guaranteed.
  * Rendering/loading hints: no promise of lower network traffic,
  * smaller JS bundles, lower memory usage, or higher video frame rates.
@@ -30,7 +30,7 @@
         optimizeSearchCards: true,
         optimizeWatchRecommendations: true,
         // Opt in: expanded replies have highly variable heights.
-        optimizeWatchComments: false,
+        optimizeWatchComments: true,
         // Additional yt-lockup-view-model selectors, without nesting
         // containment inside the legacy cards targeted below.
         includeModernCards: true,
@@ -49,6 +49,9 @@
         playerPosterWatchMs: 5000,
         maxPlayerPosterChecks: 48,
         maxThumbnailImagesPerPass: 160,
+        maxThumbnailChecksPerRoute: 640,
+        maxThumbnailPassesPerRoute: 6,
+        thumbnailRescanIntervalMs: 1200,
         // Protect leading thumbnails by DOM order, without layout measurements.
         thumbnailSkipFirst: 8,
         thumbnailHydrationDelayMs: 900,
@@ -66,20 +69,26 @@
         debug: false
     };
     // ====================================================
-    if (window.top !== window.self) return;
+    try {
+        if (window.top !== window.self) return;
+    } catch (_) { return; }
     if (location.hostname !== 'www.youtube.com' &&
         location.hostname !== 'youtube.com') return;
     //
-    const VERSION = '1.4.0';
+    const VERSION = '1.5.0';
     const STYLE_ID = 'remia-youtube-performance-style';
     const RUNTIME_ATTR = 'data-remia-yt-perf-runtime';
+    const STATUS_ATTR = 'data-remia-yt-perf-status';
     const SCROLL_ATTR = 'data-remia-yt-scrolling';
     const THUMBNAILS = [
-        ':is(ytd-browse, ytd-search) :is(ytd-thumbnail, yt-thumbnail-view-model) img',
-        'ytd-watch-flexy #related :is(ytd-thumbnail, yt-thumbnail-view-model) img'
+        ':is(ytd-browse, ytd-search) :is(ytd-thumbnail, yt-thumbnail-view-model, .ytThumbnailViewModelHost) img',
+        'ytd-watch-flexy #related :is(ytd-thumbnail, yt-thumbnail-view-model, .ytThumbnailViewModelHost) img'
     ];
     const rules = [];
     const containedSelectors = [];
+    let styleState = 'waiting';
+    let styleError = '';
+    let styleRuleCount = 0;
     const supportsContentVisibility = typeof CSS !== 'undefined' &&
         typeof CSS.supports === 'function' &&
         CSS.supports('content-visibility', 'auto') &&
@@ -106,7 +115,7 @@
             ];
             if (CONFIG.includeModernCards) {
                 selectors.push(
-                    'ytd-browse ytd-rich-grid-renderer > #contents > yt-lockup-view-model'
+                    'ytd-browse ytd-rich-grid-renderer yt-lockup-view-model:not(ytd-rich-item-renderer *, ytd-grid-video-renderer *, yt-lockup-view-model *)'
                 );
             }
             addContainment(selectors, CONFIG.estimatedBlockSize.grid, 320);
@@ -116,7 +125,7 @@
             const selectors = ['ytd-search ytd-video-renderer'];
             if (CONFIG.includeModernCards) {
                 selectors.push(
-                    'ytd-search ytd-item-section-renderer > #contents > yt-lockup-view-model:not(ytd-video-renderer *, ytd-rich-item-renderer *, yt-lockup-view-model *)'
+                    'ytd-search yt-lockup-view-model:not(ytd-video-renderer *, ytd-rich-item-renderer *, yt-lockup-view-model *)'
                 );
             }
             addContainment(selectors, CONFIG.estimatedBlockSize.search, 215);
@@ -205,18 +214,30 @@
         : '';
     //
     function startRuntime() {
-        if (!CONFIG.asyncThumbnailDecoding && !CONFIG.prioritizePlayerPoster &&
-            !CONFIG.reduceThumbnailTransitionsWhileScrolling) return;
         const root = document.documentElement;
         if (root.hasAttribute(RUNTIME_ATTR)) return;
         root.setAttribute(RUNTIME_ATTR, VERSION);
+        const listeners = new AbortController();
+        const stats = { activations: 0, passes: 0, decoding: 0, thumbnailChecks: 0,
+            posterChecks: 0, posterHints: 0, preloads: 0, navigations: 0 };
+        let failed = false;
+        let lastError = '';
+        let cardsMatched = 0;
+        let route = location.pathname + location.search;
+        let routePasses = 0;
+        let routeChecks = 0;
+        let protectedLeading = new WeakSet();
+        let protectedCount = 0;
+        let lastDecodeAt = 0;
         let suspended = false;
         let navigating = false;
         let scrolling = false;
         let scrollTimer = null;
         let decodeJob = null;
         let decodeUsesIdle = false;
+        let decodeAgain = false;
         let lateTimer = null;
+        let navigationTimer = null;
         let posterObserver = null;
         let posterRoot = null;
         let posterTimer = null;
@@ -225,9 +246,51 @@
         let posterFinished = false;
         let posterChecks = 0;
         let posterPreload = null;
+        let posterState = CONFIG.prioritizePlayerPoster ? 'idle' : 'disabled';
         //
         function active() {
-            return !suspended && !navigating && !document.hidden;
+            return !failed && !suspended && !navigating && !document.hidden;
+        }
+        function publish() {
+            const state = failed ? 'error' : suspended ? 'suspended' :
+                navigating ? 'navigating' : document.hidden ? 'waiting' :
+                posterObserver ? 'watching' : decodeJob !== null ? 'scheduled' : 'idle';
+            const report = { version: VERSION, state, route, ...stats,
+                canContain: supportsContentVisibility, style: styleState,
+                cssRules: styleRuleCount, styleError, cardsMatched,
+                routePasses, routeChecks, posterState,
+                posterWatching: !!posterObserver, error: lastError };
+            root.setAttribute(STATUS_ATTR, JSON.stringify(report));
+            if (CONFIG.debug) console.info('[Remia YT Perf]', report);
+        }
+        function guarded(task) {
+            return (...args) => {
+                if (failed) return;
+                try { return task(...args); }
+                catch (error) {
+                    failed = true;
+                    lastError = String(error && error.message || error).slice(0, 180);
+                    stopJobs();
+                    listeners.abort();
+                    const style = document.getElementById(STYLE_ID);
+                    if (style && style.getAttribute('data-remia-version') === VERSION) {
+                        style.remove();
+                        styleState = 'removed';
+                        styleRuleCount = 0;
+                    }
+                    publish();
+                    console.warn('[Remia YT Perf ' + VERSION + ']', error);
+                }
+            };
+        }
+        function listen(target, type, callback, options = {}) {
+            target.addEventListener(type, guarded(callback), {
+                ...options, signal: listeners.signal
+            });
+        }
+        function updateCardCount() {
+            cardsMatched = containedSelectors.length
+                ? document.querySelectorAll(containedSelectors.join(',')).length : 0;
         }
         function clearScrolling() {
             if (scrollTimer !== null) window.clearTimeout(scrollTimer);
@@ -250,6 +313,7 @@
             posterFinished = false;
             if (posterPreload) posterPreload.remove();
             posterPreload = null;
+            posterState = CONFIG.prioritizePlayerPoster ? 'idle' : 'disabled';
         }
         function watchVideoId() {
             if (location.pathname !== '/watch') return '';
@@ -278,18 +342,27 @@
             posterObserver.observe(target, options);
         }
         function prioritizePoster() {
-            if (!active() || watchVideoId() !== posterVideo ||
-                ++posterChecks > CONFIG.maxPlayerPosterChecks) {
+            if (!active() || watchVideoId() !== posterVideo) {
                 stopPosterWatch();
                 return true;
             }
+            if (posterChecks >= CONFIG.maxPlayerPosterChecks) {
+                posterState = 'check-limit';
+                stopPosterWatch();
+                publish();
+                return true;
+            }
+            posterChecks++;
+            stats.posterChecks++;
             const player = document.querySelector('ytd-watch-flexy:not([hidden]) ytd-player');
             if (!player) return false;
             bindPosterObserver(player);
             const video = player.querySelector('video');
             if (video && !video.paused && video.readyState >= 2) {
                 posterFinished = true;
+                posterState = 'already-playing';
                 stopPosterWatch();
+                publish();
                 return true;
             }
             const posters = player.querySelectorAll(
@@ -297,7 +370,7 @@
             );
             for (let i = 0; i < Math.min(posters.length, 4); i++) {
                 const node = posters[i];
-                if (!node.isConnected || node.closest('[hidden], [aria-hidden="true"]')) continue;
+                if (!node.isConnected || node.closest('[hidden]')) continue;
                 const overlay = node.closest('.ytp-cued-thumbnail-overlay') || node;
                 const visible = window.getComputedStyle(overlay);
                 if (visible.display === 'none' || visible.visibility === 'hidden') continue;
@@ -328,10 +401,14 @@
                         link.setAttribute('data-remia-yt-poster', posterVideo);
                         (document.head || root).appendChild(link);
                         posterPreload = link;
+                        stats.preloads++;
                     }
                 }
                 posterFinished = true;
+                posterState = 'hint-applied';
+                stats.posterHints++;
                 stopPosterWatch();
+                publish();
                 return true;
             }
             return false;
@@ -339,22 +416,28 @@
         function startPosterPriority() {
             if (!CONFIG.prioritizePlayerPoster || !active()) return;
             const id = watchVideoId();
-            if (!id || id === posterVideo) return;
+            if (!id) { posterState = 'not-watch-page'; return; }
+            if (id === posterVideo) return;
             resetPoster();
             posterVideo = id;
             posterChecks = 0;
+            posterState = 'searching';
             if (prioritizePoster() || typeof MutationObserver !== 'function') return;
-            posterObserver = new MutationObserver(() => {
+            posterObserver = new MutationObserver(guarded(() => {
                 if (posterJob !== null) return;
-                posterJob = window.setTimeout(() => {
+                posterJob = window.setTimeout(guarded(() => {
                     posterJob = null;
                     prioritizePoster();
-                }, 0);
-            });
+                }), 0);
+            }));
             bindPosterObserver(
                 document.querySelector('ytd-watch-flexy:not([hidden]) ytd-player') || root
             );
-            posterTimer = window.setTimeout(stopPosterWatch, CONFIG.playerPosterWatchMs);
+            posterTimer = window.setTimeout(guarded(() => {
+                posterState = 'watch-timeout';
+                stopPosterWatch();
+                publish();
+            }), CONFIG.playerPosterWatchMs);
         }
         function stopJobs() {
             clearScrolling();
@@ -363,109 +446,188 @@
                 else window.clearTimeout(decodeJob);
             }
             decodeJob = null;
+            decodeAgain = false;
             if (lateTimer !== null) window.clearTimeout(lateTimer);
             lateTimer = null;
+            if (navigationTimer !== null) window.clearTimeout(navigationTimer);
+            navigationTimer = null;
             stopPosterWatch();
             if (!posterFinished) posterVideo = '';
         }
         function decodeThumbnails() {
-            const images = document.querySelectorAll(THUMBNAILS.join(','));
-            const limit = Math.min(images.length, CONFIG.maxThumbnailImagesPerPass);
-            let leading = 0;
-            let changed = 0;
+            installStyle();
+            const images = document.querySelectorAll(
+                THUMBNAILS.map(selector => selector + ':not([decoding])').join(',')
+            );
+            const limit = Math.min(images.length, CONFIG.maxThumbnailImagesPerPass,
+                CONFIG.maxThumbnailChecksPerRoute - routeChecks);
+            routePasses++;
+            stats.passes++;
+            lastDecodeAt = performance.now();
             for (let i = 0; i < limit; i++) {
                 const image = images[i];
+                routeChecks++;
+                stats.thumbnailChecks++;
+                // ARIA-hidden decorative thumbnails can still be visually displayed.
                 if (!image.isConnected || image.closest(
-                    '[hidden], [aria-hidden="true"], #movie_player, ytd-player, ytd-miniplayer'
+                    '[hidden], #movie_player, ytd-player, ytd-miniplayer'
                 )) continue;
-                if (leading++ < CONFIG.thumbnailSkipFirst) continue;
+                if (protectedLeading.has(image)) continue;
+                if (protectedCount < CONFIG.thumbnailSkipFirst) {
+                    protectedLeading.add(image);
+                    protectedCount++;
+                    continue;
+                }
                 if (image.hasAttribute('decoding') ||
                     (image.getAttribute('fetchpriority') || '').trim().toLowerCase() === 'high' ||
-                    !(image.getAttribute('src') || image.getAttribute('srcset'))) continue;
+                    !(image.currentSrc || image.getAttribute('src') || image.getAttribute('srcset'))) continue;
                 image.setAttribute('decoding', 'async');
-                changed++;
+                stats.decoding++;
             }
             // No geometry reads: inspecting skipped descendants can force layout.
             // This hint does not re-decode an already displayed image.
-            if (CONFIG.debug) console.info('[Remia YT Perf] Thumbnail hints.', { changed });
+            updateCardCount();
+            publish();
         }
-        function queueDecode() {
-            if (!CONFIG.asyncThumbnailDecoding || !active() || decodeJob !== null) return;
+        function queueDecode(force = true) {
+            if (!CONFIG.asyncThumbnailDecoding || !active()) return;
+            if (routePasses >= CONFIG.maxThumbnailPassesPerRoute ||
+                routeChecks >= CONFIG.maxThumbnailChecksPerRoute) return;
+            if (decodeJob !== null) {
+                if (force) decodeAgain = true;
+                return;
+            }
+            if (!force && routePasses &&
+                performance.now() - lastDecodeAt < CONFIG.thumbnailRescanIntervalMs) {
+                decodeUsesIdle = false;
+                const delay = CONFIG.thumbnailRescanIntervalMs - (performance.now() - lastDecodeAt);
+                decodeJob = window.setTimeout(guarded(() => {
+                    decodeJob = null;
+                    queueDecode();
+                    publish();
+                }), Math.max(1, Math.ceil(delay)));
+                return;
+            }
             decodeUsesIdle = typeof window.requestIdleCallback === 'function' &&
                 typeof window.cancelIdleCallback === 'function';
-            const run = () => {
+            const run = guarded(() => {
                 decodeJob = null;
                 if (active()) decodeThumbnails();
-            };
+                else publish();
+                if (decodeAgain) {
+                    decodeAgain = false;
+                    queueDecode(false);
+                    publish();
+                }
+            });
             decodeJob = decodeUsesIdle
                 ? window.requestIdleCallback(run, { timeout: 1000 })
                 : window.setTimeout(run, 50);
         }
         function activate() {
             if (!active()) return;
+            const nextRoute = location.pathname + location.search;
+            if (nextRoute !== route) {
+                stopJobs();
+                resetPoster();
+                route = nextRoute;
+                routePasses = 0;
+                routeChecks = 0;
+                protectedLeading = new WeakSet();
+                protectedCount = 0;
+                lastDecodeAt = 0;
+                stats.navigations++;
+            }
+            stats.activations++;
+            installStyle();
+            updateCardCount();
             startPosterPriority();
-            if (document.readyState === 'loading') return;
+            if (document.readyState === 'loading') { publish(); return; }
             queueDecode();
+            publish();
             if (!CONFIG.asyncThumbnailDecoding) return;
             if (lateTimer !== null) window.clearTimeout(lateTimer);
-            lateTimer = window.setTimeout(() => {
+            lateTimer = window.setTimeout(guarded(() => {
                 lateTimer = null;
                 queueDecode();
-            }, CONFIG.thumbnailHydrationDelayMs);
+            }), CONFIG.thumbnailHydrationDelayMs);
+        }
+        function onScrollEnd() {
+            clearScrolling();
+            queueDecode(false);
+            publish();
+        }
+        function finishNavigation() {
+            if (navigationTimer !== null) window.clearTimeout(navigationTimer);
+            navigationTimer = null;
+            navigating = false;
+            activate();
         }
         function onScroll() {
             if (!active()) return;
-            if (!scrolling) {
+            if (CONFIG.reduceThumbnailTransitionsWhileScrolling && !scrolling) {
                 scrolling = true;
                 root.setAttribute(SCROLL_ATTR, '');
             }
             if (scrollTimer !== null) window.clearTimeout(scrollTimer);
-            scrollTimer = window.setTimeout(clearScrolling, CONFIG.scrollIdleMs);
+            scrollTimer = window.setTimeout(guarded(onScrollEnd), CONFIG.scrollIdleMs);
         }
         //
-        if (CONFIG.reduceThumbnailTransitionsWhileScrolling) {
-            document.addEventListener('scroll', onScroll, { passive: true, capture: true });
-            document.addEventListener('scrollend', clearScrolling, { capture: true });
+        if (CONFIG.reduceThumbnailTransitionsWhileScrolling || CONFIG.asyncThumbnailDecoding) {
+            listen(document, 'scroll', onScroll, { passive: true, capture: true });
+            listen(document, 'scrollend', onScrollEnd, { capture: true });
         }
-        document.addEventListener('yt-navigate-start', () => {
+        listen(document, 'yt-navigate-start', () => {
             navigating = true;
             stopJobs();
             resetPoster();
-        }, true);
-        document.addEventListener('yt-navigate-finish', () => {
-            navigating = false;
-            activate();
-        }, true);
-        document.addEventListener('visibilitychange', () => {
+            navigationTimer = window.setTimeout(guarded(finishNavigation), 6000);
+            publish();
+        }, { capture: true });
+        listen(document, 'yt-navigate-finish', finishNavigation, { capture: true });
+        listen(window, 'popstate', finishNavigation);
+        listen(document, 'yt-page-data-updated', () => {
+            queueDecode(false);
+        }, { capture: true });
+        listen(document, 'visibilitychange', () => {
             if (document.hidden) stopJobs();
-            else activate();
+            else finishNavigation();
+            publish();
         });
-        window.addEventListener('pagehide', () => {
+        listen(window, 'pagehide', () => {
             suspended = true;
             stopJobs();
+            publish();
         });
-        window.addEventListener('pageshow', event => {
+        listen(window, 'pageshow', event => {
             if (!event.persisted) return;
             suspended = false;
             navigating = false;
             activate();
         });
         if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', activate, { once: true });
+            listen(document, 'DOMContentLoaded', activate, { once: true });
         }
-        activate();
+        publish();
+        guarded(activate)();
     }
     //
     function installStyle() {
         const parent = document.head || document.documentElement;
         if (!parent) return false;
         let style = document.getElementById(STYLE_ID);
-        if (style && style.localName !== 'style') {
-            if (CONFIG.debug) console.warn('[Remia YT Perf] Style ID conflict.');
-            return true;
+        if (style && (style.localName !== 'style' ||
+            !style.hasAttribute('data-remia-version'))) {
+            styleState = 'id-conflict';
+            styleError = 'The stylesheet ID is already used by another element.';
+            styleRuleCount = 0;
+            return false;
         }
         if (!cssText) {
             if (style) style.remove();
+            styleState = 'not-needed';
+            styleError = '';
+            styleRuleCount = 0;
             return true;
         }
         const isNew = !style;
@@ -473,32 +635,55 @@
             style = document.createElement('style');
             style.id = STYLE_ID;
         }
-        // Refresh an older installation without creating a second stylesheet.
-        if (style.textContent !== cssText) style.textContent = cssText;
-        style.setAttribute('data-remia-version', VERSION);
-        if (isNew) parent.appendChild(style);
-        if (CONFIG.debug) {
-            console.info('[Remia YT Perf] Styles ready.', {
-                version: VERSION,
-                supportsContentVisibility,
-                containedSelectors: containedSelectors.length,
-                cssCharacters: cssText.length
-            });
+        try {
+            if (style.textContent !== cssText) style.textContent = cssText;
+            if (style.getAttribute('data-remia-version') !== VERSION) {
+                style.setAttribute('data-remia-version', VERSION);
+            }
+            if (isNew) parent.appendChild(style);
+            const sheet = style.sheet;
+            if (sheet && !sheet.disabled && sheet.cssRules.length) {
+                styleRuleCount = Array.from(sheet.cssRules).reduce((count, rule) =>
+                    count + (rule.cssRules ? rule.cssRules.length : 1), 0);
+                if (styleRuleCount > 0) {
+                    styleState = 'ready';
+                    styleError = '';
+                    return true;
+                }
+            }
+            styleError = 'The stylesheet is blocked, disabled or has no parsed rules.';
+        } catch (error) {
+            styleError = String(error && error.message || error).slice(0, 180);
         }
-        return true;
+        if (isNew) style.remove();
+        styleState = 'unavailable';
+        styleRuleCount = 0;
+        return false;
     }
     // CSS matches SPA content automatically. Poster discovery uses a temporary
     // observer; other runtime work is bounded and native browser APIs stay intact.
-    if (installStyle()) {
-        startRuntime();
-        return;
+    function boot() {
+        const root = document.documentElement;
+        if (!root) return false;
+        if (root.hasAttribute(RUNTIME_ATTR)) return true;
+        installStyle();
+        try { startRuntime(); }
+        catch (error) {
+            root.setAttribute(RUNTIME_ATTR, VERSION);
+            root.setAttribute(STATUS_ATTR, JSON.stringify({
+                version: VERSION, state: 'error', style: styleState,
+                error: String(error && error.message || error).slice(0, 180)
+            }));
+            console.warn('[Remia YT Perf ' + VERSION + ']', error);
+        }
+        return true;
     }
+    if (boot()) return;
     //
     function onReady() {
-        if (!installStyle()) return;
+        if (!boot()) return;
         document.removeEventListener('readystatechange', onReady);
         document.removeEventListener('DOMContentLoaded', onReady);
-        startRuntime();
     }
     document.addEventListener('readystatechange', onReady);
     document.addEventListener('DOMContentLoaded', onReady, { once: true });
